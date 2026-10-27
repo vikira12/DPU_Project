@@ -1,0 +1,38 @@
+# 학습 데이터·산출물 (python model/dpu_model.py로 다시 만듦)
+model/data/
+model/out/
+__pycache__/
+*.pyc
+
+# Vitis HLS 작업 디렉터리
+vitis/dpu_hls/dpu_top/
+vitis/dpu_hls/logs/
+vitis/dpu_hls/.cache/
+vitis/dpu_hls/compile_commands.json
+vitis/dpu_hls/dfx_runtime.txt
+
+# Vitis 플랫폼·앱 (vitis -s vitis/build_app.py로 다시 만듦)
+vitis/dpu_platform/
+vitis/dpu_app/
+vitis/_ide/
+vitis/logs/
+vitis/.vitis*
+vitis/**/.cache/
+vitis/.rigel_lopper/
+dfx_runtime.txt
+
+# Vivado (vivado/build_bd.tcl로 다시 만듦)
+vivado/dpu_vivado/
+vivado/*.xsa
+vivado/*.rpt
+.Xil/
+*.jou
+*.log
+*.str
+webtalk*
+vivado_pid*
+
+# 기타
+*.o
+*.exe
+.vscode/
