@@ -1,17 +1,17 @@
-# 학습 데이터·산출물 (python model/dpu_model.py로 다시 만듦)
+# 학습 데이터, 가중치
 model/data/
 model/out/
 __pycache__/
 *.pyc
 
-# Vitis HLS 작업 디렉터리
+# Vitis HLS
 vitis/dpu_hls/dpu_top/
 vitis/dpu_hls/logs/
 vitis/dpu_hls/.cache/
 vitis/dpu_hls/compile_commands.json
 vitis/dpu_hls/dfx_runtime.txt
 
-# Vitis 플랫폼·앱 (vitis -s vitis/build_app.py로 다시 만듦)
+# Vitis 플랫폼, 앱
 vitis/dpu_platform/
 vitis/dpu_app/
 vitis/_ide/
@@ -21,7 +21,7 @@ vitis/**/.cache/
 vitis/.rigel_lopper/
 dfx_runtime.txt
 
-# Vivado (vivado/build_bd.tcl로 다시 만듦)
+# Vivado
 vivado/dpu_vivado/
 vivado/*.xsa
 vivado/*.rpt

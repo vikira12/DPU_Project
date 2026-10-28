@@ -1,12 +1,9 @@
-# Zybo Z7-20 DPU 블록 디자인 생성 → 합성·구현·비트스트림 → xsa 내보내기
+# Zybo Z7-20 블록 디자인, 비트스트림, xsa 생성
 #
-#   vivado -mode batch -source vivado/build_bd.tcl                  (전체)
-#   vivado -mode batch -source vivado/build_bd.tcl -tclargs bd      (프로젝트·BD만 생성)
+#   vivado -mode batch -source vivado/build_bd.tcl              (전체)
+#   vivado -mode batch -source vivado/build_bd.tcl -tclargs bd  (BD까지만)
 #
-# 먼저 HLS IP를 패키징해 둘 것: vitis/dpu_hls/dpu_top/hls/impl/ip
-# 결과: vivado/dpu_vivado/ (프로젝트), vivado/dpu_bd_wrapper.xsa
-
-#   Vivado Tcl 콘솔에서: source D:/project/DPU/vivado/build_bd.tcl  (경로는 스크립트 위치 기준이라 현재 디렉터리 무관)
+# 결과: vivado/dpu_bd_wrapper.xsa
 set mode    [expr {[info exists argv] && [llength $argv] > 0 ? [lindex $argv 0] : "all"}]
 set here    [file normalize [file dirname [info script]]]
 set root    [file normalize "$here/.."]
@@ -25,7 +22,7 @@ update_ip_catalog
 
 create_bd_design $bd
 
-# ---- PS7: 보드 프리셋 + FCLK0 100MHz, GP0(제어), HP0 64비트(DDR 접근) ----
+# PS7 (FCLK0 100MHz, GP0, HP0 64bit)
 set ps [create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 processing_system7_0]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR" apply_board_preset "1" Master "Disable" Slave "Disable"} $ps
@@ -36,10 +33,10 @@ set_property -dict [list \
     CONFIG.PCW_S_AXI_HP0_DATA_WIDTH {64} \
 ] $ps
 
-# ---- DPU ----
+# DPU
 set dpu [create_bd_cell -type ip -vlnv xilinx.com:hls:dpu_top:1.0 dpu_0]
 
-# ---- 리셋, 인터커넥트 ----
+# 리셋, 인터커넥트
 set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7_0_100M]
 set smc_ctrl [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 axi_smc]
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $smc_ctrl
@@ -68,12 +65,12 @@ connect_bd_intf_net [get_bd_intf_pins dpu_0/m_axi_gmem0] [get_bd_intf_pins axi_s
 connect_bd_intf_net [get_bd_intf_pins dpu_0/m_axi_gmem1] [get_bd_intf_pins axi_smc_mem/S01_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_smc_mem/M00_AXI] [get_bd_intf_pins processing_system7_0/S_AXI_HP0]
 
-# 인터럽트 (폴링으로도 동작하지만 연결해 둠)
+# 인터럽트
 set_property CONFIG.PCW_USE_FABRIC_INTERRUPT {1} $ps
 set_property CONFIG.PCW_IRQ_F2P_INTR {1} $ps
 connect_bd_net [get_bd_pins dpu_0/interrupt] [get_bd_pins processing_system7_0/IRQ_F2P]
 
-# 주소: 제어 레지스터 0x40000000, DPU 마스터는 DDR 전체
+# 주소 (CTRL 0x40000000)
 assign_bd_address -offset 0x40000000 -range 64K [get_bd_addr_segs dpu_0/s_axi_CTRL/Reg]
 assign_bd_address
 
@@ -87,7 +84,7 @@ update_compile_order -fileset sources_1
 
 if {$mode eq "bd"} { return }
 
-# ---- 합성·구현·비트스트림 ----
+# 합성, 구현, 비트스트림
 launch_runs impl_1 -to_step write_bitstream -jobs 8
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {

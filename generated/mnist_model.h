@@ -3,15 +3,16 @@
 
 #include <stdint.h>
 
-#define MODEL_N_LAYERS   6
-#define MODEL_IN_H       28
-#define MODEL_IN_W       28
-#define MODEL_N_CLASS    10
-#define MODEL_W_WORDS    18000
-#define MODEL_P_WORDS    1152
+#define MNIST_N_LAYERS   6
+#define MNIST_IN_C       1
+#define MNIST_IN_H       28
+#define MNIST_IN_W       28
+#define MNIST_N_CLASS    10
+#define MNIST_W_WORDS    18000
+#define MNIST_P_WORDS    1152
 
-// 레이어별: in_h, in_w, in_ch, out_ch, type, stride, relu, pool, 가중치 시작 워드
-static const uint16_t MODEL_LAYERS[MODEL_N_LAYERS][9] = {
+// in_h, in_w, in_ch, out_ch, type, stride, relu, pool, 가중치 오프셋
+static const uint16_t MNIST_LAYERS[MNIST_N_LAYERS][9] = {
     {28, 28, 1, 16, 0, 1, 1, 1, 0},
     {14, 14, 16, 32, 0, 1, 1, 1, 1152},
     {7, 7, 32, 64, 0, 2, 1, 0, 3456},
@@ -20,9 +21,9 @@ static const uint16_t MODEL_LAYERS[MODEL_N_LAYERS][9] = {
     {1, 1, 64, 10, 2, 1, 0, 0, 17280},
 };
 
-// 가중치: 레이어 순서로 이어 붙임, 출력 채널마다 576바이트 칸
+// 가중치 (출력 채널당 576바이트)
 __attribute__((aligned(64)))
-static const int8_t MODEL_WEIGHTS[144000] = {
+static const int8_t MNIST_WEIGHTS[144000] = {
     -11, 71, -127, -112, -64, 30, -8, 107, -24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -4525,9 +4526,9 @@ static const int8_t MODEL_WEIGHTS[144000] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-// 파라미터: 레이어마다 bias[64], mult[64], shift[64]
+// 파라미터 (레이어당 bias[64], mult[64], shift[64])
 __attribute__((aligned(64)))
-static const int32_t MODEL_PARAMS[1152] = {
+static const int32_t MNIST_PARAMS[1152] = {
     -18473, -1366, 6862, -32, 31, -5584, -17071, -6499, 61, 328, 4351, -2338, 3867, -6248, 654, -151,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

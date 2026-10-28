@@ -1,16 +1,18 @@
-"""MNIST CNN 학습 → INT8 양자화 → 정수 참조 추론 → C 헤더 생성
+"""CNN 학습, INT8 양자화, C 헤더 생성 (MNIST, CIFAR-10)
 
-    python model/dpu_model.py            # 학습 + 양자화 + 헤더 생성
-    python model/dpu_model.py --skip-train  # 저장된 float 가중치로 양자화·헤더만
+    python model/dpu_model.py --model mnist
+    python model/dpu_model.py --model cifar10 --epochs 20
+    python model/dpu_model.py --model mnist --skip-train  # 저장된 가중치로 헤더만
 
-정수 규약 (HLS dpu_top과 비트 단위로 같아야 함)
-  - 활성화: INT8 대칭 (zero point 0), 레이어 출력마다 스케일 하나
-  - 가중치: INT8 대칭, 출력 채널별 스케일
-  - bias  : INT32, 스케일 = s_in × s_w[oc]
-  - 재양자화: sat8( round_away( acc × mult / 2^shift ) ) → [ReLU] → [2×2 maxpool]
+양자화
+  - 활성화: INT8 대칭, 레이어마다 스케일 1개
+  - 가중치: INT8 대칭, 출력 채널별 스케일 (BN은 conv에 합침)
+  - bias  : INT32, 스케일 s_in * s_w
+  - 재양자화: sat8(round_away(acc * mult / 2^shift))
 """
 import argparse
 import os
+import time
 
 import numpy as np
 import torch
@@ -24,89 +26,138 @@ OUT_DIR = os.path.join(ROOT, "out")
 GEN_DIR = os.path.join(os.path.dirname(ROOT), "generated")
 
 LAYER_CONV3X3, LAYER_DW3X3, LAYER_PW1X1 = 0, 1, 2
+C, D, P = LAYER_CONV3X3, LAYER_DW3X3, LAYER_PW1X1
 
-# (종류, in_ch, out_ch, stride, relu, pool)
-LAYERS = [
-    (LAYER_CONV3X3, 1, 16, 1, 1, 1),   # 28×28 → 14×14
-    (LAYER_CONV3X3, 16, 32, 1, 1, 1),  # 14×14 → 7×7
-    (LAYER_CONV3X3, 32, 64, 2, 1, 0),  # 7×7 → 4×4
-    (LAYER_CONV3X3, 64, 64, 1, 1, 1),  # 4×4 → 2×2
-    (LAYER_CONV3X3, 64, 64, 1, 1, 1),  # 2×2 → 1×1
-    (LAYER_PW1X1, 64, 10, 1, 0, 0),    # FC (1×1 공간에서 pointwise)
-]
+IN_SCALE = 1.0 / 127.0     # 입력 스케일
 
-IN_SCALE = 1.0 / 127.0     # 입력 [0, 1] → INT8 [0, 127]
-N_TEST_VEC = 100           # 헤더에 넣을 테스트 이미지 수
-
-# DPU 메모리 배치 (dpu_types.h와 같아야 함)
+# DPU 메모리 배치 (dpu_types.h와 동일)
 MAX_CH = 64
 WORD_BYTES = 8
-OC_SLOT_BYTES = MAX_CH * 9  # 출력 채널 하나의 가중치 칸 576바이트
+OC_SLOT_BYTES = MAX_CH * 9  # 출력 채널당 576바이트
+
+# 레이어: (종류, in_ch, out_ch, stride, relu, pool)
+MODELS = {
+    "mnist": dict(
+        prefix="MNIST", shape=(1, 28, 28), bn=False, epochs=4, lr=2e-3, n_tv=100,
+        signed_input=False,
+        layers=[
+            (C, 1, 16, 1, 1, 1),    # 28×28 → 14×14
+            (C, 16, 32, 1, 1, 1),   # 14×14 → 7×7
+            (C, 32, 64, 2, 1, 0),   # 7×7 → 4×4
+            (C, 64, 64, 1, 1, 1),   # 4×4 → 2×2
+            (C, 64, 64, 1, 1, 1),   # 2×2 → 1×1
+            (P, 64, 10, 1, 0, 0),   # FC
+        ]),
+    "cifar10": dict(
+        prefix="CIFAR", shape=(3, 32, 32), bn=True, epochs=20, lr=4e-3, n_tv=200,
+        signed_input=True,
+        layers=[
+            (C, 3, 32, 1, 1, 0),    # 32×32
+            (C, 32, 32, 1, 1, 1),   # 32×32 → 16×16
+            (D, 32, 32, 1, 1, 0),   # depthwise
+            (P, 32, 64, 1, 1, 0),   # pointwise
+            (C, 64, 64, 1, 1, 1),   # 16×16 → 8×8
+            (D, 64, 64, 1, 1, 0),
+            (P, 64, 64, 1, 1, 0),
+            (C, 64, 64, 1, 1, 1),   # 8×8 → 4×4
+            (C, 64, 64, 2, 1, 0),   # 4×4 → 2×2
+            (C, 64, 64, 1, 1, 1),   # 2×2 → 1×1
+            (P, 64, 10, 1, 0, 0),   # FC
+        ]),
+}
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg):
         super().__init__()
+        self.layers = cfg["layers"]
         self.convs = nn.ModuleList()
-        for t, ic, oc, s, _, _ in LAYERS:
-            k = 1 if t == LAYER_PW1X1 else 3
-            self.convs.append(nn.Conv2d(ic, oc, k, stride=s, padding=k // 2))
+        for t, ic, oc, s, _, _ in self.layers:
+            k = 1 if t == P else 3
+            self.convs.append(nn.Conv2d(ic, oc, k, stride=s, padding=k // 2,
+                                        groups=ic if t == D else 1))
+        if cfg["bn"]:
+            # FC 제외 BN
+            self.bns = nn.ModuleList(nn.BatchNorm2d(L[2]) for L in self.layers[:-1])
+        else:
+            self.bns = None
 
-    def forward(self, x):
-        for conv, (_, _, _, _, relu, pool) in zip(self.convs, LAYERS):
+    def forward(self, x, collect=None):
+        for i, (conv, (_, _, _, _, relu, pool)) in enumerate(zip(self.convs, self.layers)):
             x = conv(x)
+            if self.bns is not None and i < len(self.bns):
+                x = self.bns[i](x)
             if relu:
                 x = F.relu(x)
             if pool:
                 x = F.max_pool2d(x, 2)
+            if collect is not None:
+                collect.append(x)
         return x.flatten(1)
 
 
-def load_mnist(train):
-    tf = transforms.ToTensor()
-    return datasets.MNIST(DATA_DIR, train=train, download=True, transform=tf)
+def load_dataset(name, train, augment=False):
+    tf = [transforms.ToTensor()]
+    if augment and name == "cifar10":
+        tf = [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()] + tf
+    tf = transforms.Compose(tf)
+    if name == "mnist":
+        return datasets.MNIST(DATA_DIR, train=train, download=True, transform=tf)
+    return datasets.CIFAR10(DATA_DIR, train=train, download=True, transform=tf)
 
 
-def quant_input(x):
-    """[0, 1] float 이미지 → INT8"""
-    return torch.clamp(torch.round(x / IN_SCALE), -128, 127)
+def to_real(x, cfg):
+    """[0, 1] 입력 변환 (CIFAR는 [-1, 1])"""
+    return x * 2 - 1 if cfg["signed_input"] else x
 
 
-def train(epochs=4):
+def quant_input(x, cfg):
+    """입력 INT8 양자화"""
+    return torch.clamp(torch.round(to_real(x, cfg) / IN_SCALE), -128, 127)
+
+
+def model_in(x, cfg):
+    """INT8로 양자화한 입력을 실수로 복원"""
+    return quant_input(x, cfg) * IN_SCALE
+
+
+def train(name, cfg, epochs):
     torch.manual_seed(0)
-    tr = torch.utils.data.DataLoader(load_mnist(True), batch_size=128, shuffle=True)
-    te = torch.utils.data.DataLoader(load_mnist(False), batch_size=1000)
-    net = Net()
-    opt = torch.optim.Adam(net.parameters(), lr=2e-3)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs * len(tr))
+    tr = torch.utils.data.DataLoader(load_dataset(name, True, augment=True), batch_size=128,
+                                     shuffle=True, num_workers=0)
+    te = torch.utils.data.DataLoader(load_dataset(name, False), batch_size=1000)
+    net = Net(cfg)
+    opt = torch.optim.AdamW(net.parameters(), lr=cfg["lr"], weight_decay=5e-4 if cfg["bn"] else 0)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, cfg["lr"], total_steps=epochs * len(tr)) \
+        if cfg["bn"] else torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs * len(tr))
     for ep in range(epochs):
         net.train()
+        t0 = time.time()
         for x, y in tr:
-            # 학습 입력도 INT8 격자에 맞춰 둠 (양자화 오차 감소)
-            x = quant_input(x) * IN_SCALE
-            loss = F.cross_entropy(net(x), y)
+            loss = F.cross_entropy(net(model_in(x, cfg)), y)
             opt.zero_grad()
             loss.backward()
             opt.step()
             sched.step()
-        print(f"epoch {ep + 1}: float acc {evaluate_float(net, te):.4f}")
+        print(f"epoch {ep + 1}: float acc {evaluate_float(net, te, cfg):.4f} ({time.time() - t0:.0f}s)",
+              flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
-    torch.save(net.state_dict(), os.path.join(OUT_DIR, "mnist_float.pt"))
+    torch.save(net.state_dict(), os.path.join(OUT_DIR, f"{name}_float.pt"))
     return net
 
 
 @torch.no_grad()
-def evaluate_float(net, loader):
+def evaluate_float(net, loader, cfg):
     net.eval()
     ok = n = 0
     for x, y in loader:
-        ok += (net(quant_input(x) * IN_SCALE).argmax(1) == y).sum().item()
+        ok += (net(model_in(x, cfg)).argmax(1) == y).sum().item()
         n += len(y)
     return ok / n
 
 
 def requant_params(m):
-    """실수 배율 m (> 0) → (mult, shift), mult < 2^31"""
+    """실수 배율을 (mult, shift)로 변환"""
     shift = 0
     while shift < 62 and m * (1 << (shift + 1)) < (1 << 31):
         shift += 1
@@ -115,7 +166,7 @@ def requant_params(m):
 
 
 def requant(acc, mult, shift, relu):
-    """HLS requant()과 같은 계산. acc: int64 [N, C, H, W], mult/shift: [C]"""
+    """재양자화 (HLS requant와 동일)"""
     prod = acc * mult.reshape(1, -1, 1, 1)
     half = np.where(shift == 0, 0, np.left_shift(np.int64(1), np.maximum(shift - 1, 0)))
     q = (np.abs(prod) + half.reshape(1, -1, 1, 1)) >> shift.reshape(1, -1, 1, 1)
@@ -126,46 +177,54 @@ def requant(acc, mult, shift, relu):
 
 
 def int_layer(x, q, L):
-    """정수 레이어 하나. x: int64 [N, C, H, W] → int64"""
-    t, _, _, s, relu, pool = L
-    k = 1 if t == LAYER_PW1X1 else 3
-    # 누산값 최대 |64 × 9 × 128 × 128| + bias < 2^53 → float64 conv가 정확한 정수 결과
+    """정수 레이어 연산"""
+    t, ic, _, s, relu, pool = L
+    k = 1 if t == P else 3
+    # float64 conv로 정수 결과 계산 (누산값 < 2^53)
     acc = F.conv2d(torch.from_numpy(x).double(), torch.from_numpy(q["w"]).double(),
-                   torch.from_numpy(q["b"]).double(), stride=s, padding=k // 2)
+                   torch.from_numpy(q["b"]).double(), stride=s, padding=k // 2,
+                   groups=ic if t == D else 1)
     v = requant(acc.round().long().numpy(), q["mult"], q["shift"], relu)
     if pool:
         v = F.max_pool2d(torch.from_numpy(v).double(), 2).long().numpy()
     return v
 
 
-def int_forward(x, qlayers, keep=False):
+def int_forward(x, qlayers, layers, keep=False):
     outs = []
-    for q, L in zip(qlayers, LAYERS):
+    for q, L in zip(qlayers, layers):
         x = int_layer(x, q, L)
         outs.append(x)
     return outs if keep else x
 
 
+def folded(net, i):
+    """BN을 합친 weight, bias"""
+    conv = net.convs[i]
+    w = conv.weight.detach().double()
+    b = conv.bias.detach().double()
+    if net.bns is not None and i < len(net.bns):
+        bn = net.bns[i]
+        g = bn.weight.detach().double() / torch.sqrt(bn.running_var.double() + bn.eps)
+        w = w * g.reshape(-1, 1, 1, 1)
+        b = (b - bn.running_mean.double()) * g + bn.bias.detach().double()
+    return w.numpy(), b.numpy()
+
+
 @torch.no_grad()
-def quantize(net):
-    """보정: 학습셋 2000장으로 레이어 출력 최대값 → 활성화 스케일"""
+def quantize(name, cfg, net):
+    """양자화 (학습 이미지 2000장, 99.99% 분위수로 활성화 스케일 보정)"""
     net.eval()
-    xs = torch.stack([load_mnist(True)[i][0] for i in range(2000)])
-    x = quant_input(xs) * IN_SCALE
-    amax = []
-    for conv, (_, _, _, _, relu, pool) in zip(net.convs, LAYERS):
-        x = conv(x)
-        if relu:
-            x = F.relu(x)
-        if pool:
-            x = F.max_pool2d(x, 2)
-        amax.append(torch.quantile(x.abs().flatten()[::7], 0.9999).item())
+    ds = load_dataset(name, True)
+    xs = torch.stack([ds[i][0] for i in range(2000)])
+    outs = []
+    net(model_in(xs, cfg), collect=outs)
+    amax = [torch.quantile(o.abs().flatten()[::7][:16_000_000], 0.9999).item() for o in outs]
 
     qlayers = []
     s_in = IN_SCALE
-    for i, (conv, L) in enumerate(zip(net.convs, LAYERS)):
-        w = conv.weight.detach().numpy().astype(np.float64)
-        b = conv.bias.detach().numpy().astype(np.float64)
+    for i, L in enumerate(cfg["layers"]):
+        w, b = folded(net, i)
         s_w = np.maximum(np.abs(w).reshape(w.shape[0], -1).max(1), 1e-12) / 127.0
         s_out = amax[i] / 127.0
         wq = np.clip(np.round(w / s_w.reshape(-1, 1, 1, 1)), -127, 127).astype(np.int64)
@@ -179,20 +238,18 @@ def quantize(net):
     return qlayers
 
 
-def evaluate_int(qlayers):
-    ds = load_mnist(False)
-    xs = quant_input(torch.stack([ds[i][0] for i in range(len(ds))])).long().numpy()
+def evaluate_int(name, cfg, qlayers):
+    ds = load_dataset(name, False)
+    xs = quant_input(torch.stack([ds[i][0] for i in range(len(ds))]), cfg).long().numpy()
     ys = np.array([ds[i][1] for i in range(len(ds))])
     ok = 0
-    for i in range(0, len(xs), 1000):
-        logit = int_forward(xs[i:i + 1000], qlayers).reshape(-1, 10)
-        ok += (logit.argmax(1) == ys[i:i + 1000]).sum()
+    for i in range(0, len(xs), 500):
+        logit = int_forward(xs[i:i + 500], qlayers, cfg["layers"]).reshape(-1, 10)
+        ok += (logit.argmax(1) == ys[i:i + 500]).sum()
     return ok / len(xs), xs, ys
 
 
-# ----------------------------------------------------------------------
 # C 헤더 생성
-# ----------------------------------------------------------------------
 def c_array(ctype, name, vals, per_line=16):
     vals = [int(v) for v in vals]
     lines = []
@@ -202,19 +259,33 @@ def c_array(ctype, name, vals, per_line=16):
 
 
 def pack_weights(q, L):
-    """출력 채널마다 576바이트 칸. CONV3X3 [ic][3][3], PW1X1 [ic]"""
+    """가중치 배치 (출력 채널당 576바이트)"""
     w = q["w"]
     buf = np.zeros((w.shape[0], OC_SLOT_BYTES), dtype=np.int8)
     for oc in range(w.shape[0]):
-        flat = w[oc].reshape(-1) if L[0] == LAYER_CONV3X3 else w[oc, :, 0, 0]
+        flat = w[oc, :, 0, 0] if L[0] == P else w[oc].reshape(-1)
         buf[oc, :len(flat)] = flat
     return buf.reshape(-1)
 
 
-def export(qlayers, xs, ys):
+def layer_shapes(cfg):
+    c, h, w = cfg["shape"]
+    shapes = []
+    for t, ic, oc, s, relu, pool in cfg["layers"]:
+        assert ic == c and (t != D or ic == oc) and ic <= MAX_CH and oc <= MAX_CH
+        oh, ow = (h - 1) // s + 1, (w - 1) // s + 1
+        shapes.append((h, w, ic, oc))
+        c, h, w = oc, (oh // 2 if pool else oh), (ow // 2 if pool else ow)
+    assert (c, h, w) == (10, 1, 1)
+    return shapes
+
+
+def export(name, cfg, qlayers, xs, ys):
     os.makedirs(GEN_DIR, exist_ok=True)
-    n = len(LAYERS)
-    w_blobs = [pack_weights(q, L) for q, L in zip(qlayers, LAYERS)]
+    X = cfg["prefix"]
+    layers = cfg["layers"]
+    n = len(layers)
+    w_blobs = [pack_weights(q, L) for q, L in zip(qlayers, layers)]
     w_off = np.cumsum([0] + [len(b) // WORD_BYTES for b in w_blobs])[:-1]
     params = []
     for q in qlayers:
@@ -224,74 +295,73 @@ def export(qlayers, xs, ys):
         p[MAX_CH:MAX_CH + oc] = q["mult"]
         p[2 * MAX_CH:2 * MAX_CH + oc] = q["shift"]
         params.append(p)
+    shapes = layer_shapes(cfg)
+    in_c, in_h, in_w = cfg["shape"]
 
-    h = in_w = 28
-    shapes = []
-    for t, ic, oc, s, relu, pool in LAYERS:
-        oh = (h - 1) // s + 1
-        shapes.append((h, in_w, ic, oc))
-        h = in_w = oh // 2 if pool else oh
-
-    with open(os.path.join(GEN_DIR, "mnist_model.h"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("#ifndef MNIST_MODEL_H\n#define MNIST_MODEL_H\n\n#include <stdint.h>\n\n")
-        f.write(f"#define MODEL_N_LAYERS   {n}\n")
-        f.write(f"#define MODEL_IN_H       28\n#define MODEL_IN_W       28\n")
-        f.write(f"#define MODEL_N_CLASS    10\n")
-        f.write(f"#define MODEL_W_WORDS    {sum(len(b) for b in w_blobs) // WORD_BYTES}\n")
-        f.write(f"#define MODEL_P_WORDS    {n * 3 * MAX_CH}\n\n")
-        f.write("// 레이어별: in_h, in_w, in_ch, out_ch, type, stride, relu, pool, 가중치 시작 워드\n")
-        f.write("static const uint16_t MODEL_LAYERS[MODEL_N_LAYERS][9] = {\n")
-        for (ih, iw, ic, oc), L, wo in zip(shapes, LAYERS, w_off):
+    with open(os.path.join(GEN_DIR, f"{name}_model.h"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"#ifndef {X}_MODEL_H\n#define {X}_MODEL_H\n\n#include <stdint.h>\n\n")
+        f.write(f"#define {X}_N_LAYERS   {n}\n")
+        f.write(f"#define {X}_IN_C       {in_c}\n#define {X}_IN_H       {in_h}\n#define {X}_IN_W       {in_w}\n")
+        f.write(f"#define {X}_N_CLASS    10\n")
+        f.write(f"#define {X}_W_WORDS    {sum(len(b) for b in w_blobs) // WORD_BYTES}\n")
+        f.write(f"#define {X}_P_WORDS    {n * 3 * MAX_CH}\n\n")
+        f.write("// in_h, in_w, in_ch, out_ch, type, stride, relu, pool, 가중치 오프셋\n")
+        f.write(f"static const uint16_t {X}_LAYERS[{X}_N_LAYERS][9] = {{\n")
+        for (ih, iw, ic, oc), L, wo in zip(shapes, layers, w_off):
             t, _, _, s, relu, pool = L
             f.write(f"    {{{ih}, {iw}, {ic}, {oc}, {t}, {s}, {relu}, {pool}, {wo}}},\n")
         f.write("};\n\n")
-        f.write("// 가중치: 레이어 순서로 이어 붙임, 출력 채널마다 576바이트 칸\n")
+        f.write("// 가중치 (출력 채널당 576바이트)\n")
         f.write("__attribute__((aligned(64)))\n")
-        f.write(c_array("int8_t", "MODEL_WEIGHTS", np.concatenate(w_blobs), 32))
-        f.write("\n// 파라미터: 레이어마다 bias[64], mult[64], shift[64]\n")
+        f.write(c_array("int8_t", f"{X}_WEIGHTS", np.concatenate(w_blobs), 32))
+        f.write("\n// 파라미터 (레이어당 bias[64], mult[64], shift[64])\n")
         f.write("__attribute__((aligned(64)))\n")
-        f.write(c_array("int32_t", "MODEL_PARAMS", np.concatenate(params), 16))
+        f.write(c_array("int32_t", f"{X}_PARAMS", np.concatenate(params), 16))
         f.write("\n#endif\n")
 
-    # 테스트 벡터: 이미지, 정답, 정수 추론 로짓, 첫 이미지의 레이어별 출력
-    xt = xs[:N_TEST_VEC]
-    logits = int_forward(xt, qlayers).reshape(-1, 10)
-    layer_outs = int_forward(xt[:1], qlayers, keep=True)
-    with open(os.path.join(GEN_DIR, "mnist_testvec.h"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("#ifndef MNIST_TESTVEC_H\n#define MNIST_TESTVEC_H\n\n#include <stdint.h>\n\n")
-        f.write(f"#define TV_N {N_TEST_VEC}\n\n")
-        f.write(c_array("int8_t", "TV_IMAGES", xt.reshape(-1), 28))
-        f.write(c_array("uint8_t", "TV_LABELS", ys[:N_TEST_VEC], 25))
-        f.write(c_array("int8_t", "TV_LOGITS", logits.reshape(-1), 10))
-        f.write("\n// 첫 이미지의 레이어별 출력 [C][H][W] (조밀 배치)\n")
+    # 테스트 벡터
+    n_tv = cfg["n_tv"]
+    xt = xs[:n_tv]
+    logits = int_forward(xt, qlayers, layers).reshape(-1, 10)
+    layer_outs = int_forward(xt[:1], qlayers, layers, keep=True)
+    with open(os.path.join(GEN_DIR, f"{name}_testvec.h"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"#ifndef {X}_TESTVEC_H\n#define {X}_TESTVEC_H\n\n#include <stdint.h>\n\n")
+        f.write(f"#define {X}_TV_N {n_tv}\n\n")
+        f.write("// 이미지 [N][C][H][W]\n")
+        f.write(c_array("int8_t", f"{X}_TV_IMAGES", xt.reshape(-1), 32))
+        f.write(c_array("uint8_t", f"{X}_TV_LABELS", ys[:n_tv], 25))
+        f.write(c_array("int8_t", f"{X}_TV_LOGITS", logits.reshape(-1), 10))
+        f.write("\n// 첫 이미지 레이어별 출력\n")
         for i, o in enumerate(layer_outs):
-            f.write(c_array("int8_t", f"TV_L{i}_OUT", o[0].reshape(-1), 16))
-        f.write("static const int8_t *const TV_LAYER_OUT[%d] = {%s};\n"
-                % (n, ", ".join(f"TV_L{i}_OUT" for i in range(n))))
+            f.write(c_array("int8_t", f"{X}_TV_L{i}_OUT", o[0].reshape(-1), 16))
+        f.write(f"static const int8_t *const {X}_TV_LAYER_OUT[{n}] = {{%s}};\n"
+                % ", ".join(f"{X}_TV_L{i}_OUT" for i in range(n)))
         f.write("\n#endif\n")
-    print(f"headers → {GEN_DIR}")
+    print(f"headers: {GEN_DIR}")
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", choices=sorted(MODELS), default="mnist")
     ap.add_argument("--skip-train", action="store_true")
-    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--epochs", type=int)
     a = ap.parse_args()
+    name, cfg = a.model, MODELS[a.model]
 
     if a.skip_train:
-        net = Net()
-        net.load_state_dict(torch.load(os.path.join(OUT_DIR, "mnist_float.pt")))
+        net = Net(cfg)
+        net.load_state_dict(torch.load(os.path.join(OUT_DIR, f"{name}_float.pt")))
     else:
-        net = train(a.epochs)
-    te = torch.utils.data.DataLoader(load_mnist(False), batch_size=1000)
-    print(f"float acc {evaluate_float(net, te):.4f}")
-    qlayers = quantize(net)
-    acc, xs, ys = evaluate_int(qlayers)
+        net = train(name, cfg, a.epochs or cfg["epochs"])
+    te = torch.utils.data.DataLoader(load_dataset(name, False), batch_size=1000)
+    print(f"float acc {evaluate_float(net, te, cfg):.4f}")
+    qlayers = quantize(name, cfg, net)
+    acc, xs, ys = evaluate_int(name, cfg, qlayers)
     print(f"int8  acc {acc:.4f}")
     for i, q in enumerate(qlayers):
         print(f"L{i}: shift {q['shift'].min()}~{q['shift'].max()}, "
               f"mult {q['mult'].min()}~{q['mult'].max()}, s_out {q['s_out']:.5f}")
-    export(qlayers, xs, ys)
+    export(name, cfg, qlayers, xs, ys)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,6 @@
-"""Vivado xsa → Vitis 플랫폼 → 보드 검증 앱(dpu_app) 생성·빌드
+"""Vitis 플랫폼, 보드 앱 생성 및 빌드
 
-사용 (DPU 저장소 루트에서): vitis -s vitis/build_app.py
-  - 처음 실행: vitis/ 작업 공간에 dpu_platform, dpu_app 컴포넌트를 만듦
-  - 다시 실행: 플랫폼 하드웨어를 새 xsa로 갱신하고 다시 빌드
-  Vitis IDE가 이 작업 공간을 열고 있으면 실패하므로 IDE를 닫고 실행
-앱은 sw/src의 소스와 generated/ 헤더를 직접 빌드함 (UserConfig.cmake를 이 스크립트가 고쳐 씀)
+사용: vitis -s vitis/build_app.py (Vitis IDE를 닫고 실행)
 결과: vitis/dpu_app/build/dpu_app.elf
 """
 import os
@@ -19,11 +15,11 @@ PLATFORM = "dpu_platform"
 APP = "dpu_app"
 DOMAIN = "standalone_ps7_cortexa9_0"
 SRC = '"${CMAKE_SOURCE_DIR}/../../../sw/src/'
-SOURCES = ["dpu_test.c", "dpu_net.c"]
+SOURCES = ["dpu_test.c", "dpu_net.c", "models.c"]
 
 
 def set_user_config():
-    """UserConfig.cmake의 USER_COMPILE_SOURCES·USER_INCLUDE_DIRECTORIES·최적화 수준 지정"""
+    """앱 소스, include 경로, 최적화 옵션 설정"""
     p = os.path.join(WS, APP, "src", "UserConfig.cmake")
     raw = open(p, "rb").read().decode("utf8")
     crlf = "\r\n" in raw
@@ -37,7 +33,6 @@ def set_user_config():
     if crlf:
         s = s.replace("\n", "\r\n")
     open(p, "wb").write(s.encode("utf8"))
-
 
 
 if not os.path.exists(XSA):
@@ -59,7 +54,7 @@ xpfm = os.path.join(WS, PLATFORM, "export", PLATFORM, PLATFORM + ".xpfm")
 
 if os.path.isdir(os.path.join(WS, APP)):
     app = client.get_component(name=APP)
-    # 앱 실행 설정은 _ide/의 비트스트림·ps7_init 복사본을 쓰므로 새 플랫폼 것으로 바꿔 둠
+    # _ide/의 비트스트림, ps7_init 갱신
     hw = os.path.join(WS, PLATFORM, "export", PLATFORM, "hw", "sdt")
     for src, dst in (("dpu_bd_wrapper.bit", "bitstream"), ("ps7_init.tcl", "psinit")):
         if os.path.exists(os.path.join(hw, src)):
@@ -70,7 +65,7 @@ else:
     app = client.create_app_component(name=APP, platform=xpfm, domain=DOMAIN, template="empty_application")
 
 def fix_launch():
-    """Vitis가 HLS 드라이버의 dpu_top.tcl을 ps7 초기화 스크립트로 잡는 경우가 있어 ps7_init.tcl로 고정"""
+    """실행 설정의 ps7 초기화 스크립트를 ps7_init.tcl로 고정"""
     p = os.path.join(WS, APP, "_ide", "launch.json")
     if not os.path.exists(p):
         return
